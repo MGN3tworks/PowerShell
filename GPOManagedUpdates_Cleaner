@@ -1,0 +1,118 @@
+# PowerShell script to delete the WindowsUpdate registry keys, clear local GPO cache, force sync with Intune, force GPUpdate, and restart
+$RegistryPath1 = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate"
+$RegistryPath2 = "HKLM:\SOFTWARE\Microsoft\WindowsUpdate"
+$GroupPolicyPaths = @(
+    "C:\Windows\System32\GroupPolicy",
+    "C:\Windows\System32\GroupPolicyUsers"
+)
+$LogFile = "C:\Windows\Temp\DeleteWindowsUpdateRegistry.log"
+$SentinelFile = "C:\Windows\Temp\WindowsUpdateKeyDeleted.sentinel"
+$IntunePath = "C:\Program Files (x86)\Microsoft Intune Management Extension\Microsoft.Management.Services.IntuneWindowsAgent.exe"
+
+# Function to log messages with timestamps
+function Write-Log {
+    param ([string]$Message)
+    $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    "$Timestamp - $Message" | Out-File -FilePath $LogFile -Append -Encoding UTF8
+}
+
+# Function to trigger Intune sync
+function Invoke-IntuneSync {
+    try {
+        if (Test-Path $IntunePath) {
+            Write-Log "Triggering Intune device sync..."
+            Start-Process -FilePath $IntunePath -ArgumentList "intunemanagementextension://syncapp" -NoNewWindow
+            Write-Log "Intune sync triggered successfully."
+        } else {
+            Write-Log "Microsoft.Management.Services.IntuneWindowsAgent.exe not found at: $IntunePath"
+        }
+    } catch {
+        Write-Log "Failed to trigger Intune sync: $($_.Exception.Message)"
+    }
+}
+
+# Function to trigger a Group Policy update
+function Invoke-GPUpdate {
+    try {
+        Write-Log "Triggering gpupdate /force..."
+        $GpUpdateResult = Start-Process -FilePath "gpupdate" -ArgumentList "/force" -Wait -PassThru -NoNewWindow
+        if ($GpUpdateResult.ExitCode -eq 0) {
+            Write-Log "Group Policy update completed successfully."
+        } else {
+            Write-Log "Group Policy update failed with exit code: $($GpUpdateResult.ExitCode)"
+        }
+    } catch {
+        Write-Log "Failed to trigger Group Policy update: $($_.Exception.Message)"
+    }
+}
+
+# Function to delete local GPO cache
+function Clear-LocalGpoCache {
+    foreach ($Path in $GroupPolicyPaths) {
+        try {
+            if (Test-Path $Path) {
+                Remove-Item -Path $Path -Recurse -Force
+                Write-Log "Deleted local GPO cache folder: $Path"
+            } else {
+                Write-Log "GPO cache folder not found (already removed): $Path"
+            }
+        } catch {
+            Write-Log "Failed to delete GPO cache folder ($Path): $($_.Exception.Message)"
+        }
+    }
+}
+
+try {
+    if (Test-Path $SentinelFile) {
+        Write-Log "Sentinel file found. The script has already been run. Exiting."
+        exit 0
+    }
+
+    # Delete the first WindowsUpdate registry key if it exists
+    if (Test-Path $RegistryPath1) {
+        Remove-Item -Path $RegistryPath1 -Recurse -Force -ErrorAction Stop
+        Write-Log "Successfully deleted registry key: $RegistryPath1"
+    } else {
+        Write-Log "Registry key not found: $RegistryPath1. No action taken."
+    }
+
+    # Delete the second WindowsUpdate registry key if it exists
+    if (Test-Path $RegistryPath2) {
+        Remove-Item -Path $RegistryPath2 -Recurse -Force -ErrorAction Stop
+        Write-Log "Successfully deleted registry key: $RegistryPath2"
+    } else {
+        Write-Log "Registry key not found: $RegistryPath2. No action taken."
+    }
+
+    # Clear local GPO cache
+    Clear-LocalGpoCache
+
+    # Trigger Intune sync and Group Policy update
+    Invoke-IntuneSync
+    Invoke-GPUpdate
+
+    # Create sentinel file to avoid re-running
+    New-Item -Path $SentinelFile -ItemType File -Force | Out-Null
+
+    # Log and restart
+    Write-Log "Restarting computer to complete cleanup..."
+    Restart-Computer -Force
+
+    exit 0
+} catch {
+    $ErrorMessage = "Error occurred: $($_.Exception.Message)"
+    Write-Log $ErrorMessage
+
+    # Still run cleanup even on error
+    Clear-LocalGpoCache
+    Invoke-IntuneSync
+    Invoke-GPUpdate
+
+    New-Item -Path $SentinelFile -ItemType File -Force | Out-Null
+
+    # Log and restart even on failure to ensure clean state
+    Write-Log "Restarting computer after error to ensure environment is refreshed..."
+    Restart-Computer -Force
+
+    exit 1
+}
